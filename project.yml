@@ -2,10 +2,10 @@ packages:
   - name: code
     environment:
       GITHUB_CLASSIC_TOKEN: '${GITHUB_CLASSIC_TOKEN}'
-      #LOG_DESTINATIONS: '[{"papertrail":{"token":"${PAPERTRAIL_TOKEN}"}}]'
     actions:
-      - name: github-jira-webhook 
-        runtime: nodejs:default  
+      - name: github-jira-webhook
+        runtime: nodejs:default
         limits:
           timeout: 15000
           memory: 256
+          logs: 200

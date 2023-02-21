@@ -8,7 +8,9 @@
  */
 
 // eslint-disable-next-line import/no-extraneous-dependencies
-const { Octokit } = require("@octokit/core");
+const { Octokit } = require("@octokit/rest");
+const { cherryPickCommits } = require("github-cherry-pick");
+
 
 const octokit = new Octokit({ auth: process.env.GITHUB_CLASSIC_TOKEN });
 
@@ -31,6 +33,7 @@ const startsWithRelease = (title) => {
 const containsTicketKey = (title, ticketKey) => {
   const projectPrefix = ticketKey.split("-")[0];
   const containsTicketKeyRegex = new RegExp(`(${projectPrefix}-\\d+)`, "i");
+
   return title.match(containsTicketKeyRegex);
 };
 
@@ -76,14 +79,49 @@ const isTicketInPrTitle = (prTitle, ticketKey) => {
   };
 };
 
+async function findCommits(gitRepoOwner, gitRepoName, sourceBranch, ticketKey) {
+  try {
+    const { data: commits } = await octokit.request(
+      "GET /repos/{owner}/{repo}/commits",
+      {
+        owner: gitRepoOwner,
+        repo: gitRepoName,
+        sha: sourceBranch,
+        per_page: 100
+      }
+    );
+    console.log(ticketKey);
+    const pickedCommits = commits.filter((commit) => {
+      console.log(commit.commit.message);
+      console.log(commit.commit.message.includes(ticketKey));
+      if (commit.commit.message.includes(ticketKey)) {
+        return true;
+      }
+      return false;
+    });
+
+    return pickedCommits;
+  } catch (error) {
+    throw new Error(
+      `Failed to find commits that need to cherry-picked: ${error.message}`
+    );
+  }
+}
+
 /**
  * Finds the pull request for the given ticket key
  * @param {string} ticketKey  The ticket key to search for in the pull request title
  * @param {string} gitRepoName
  * @param {string} gitRepoOwner
+ * @param {string} mergeTargetBranch
  * @returns {object} {success: boolean, message: string, data: number}
  */
-async function findPullRequest(ticketKey, gitRepoName, gitRepoOwner) {
+async function findPullRequest(
+  ticketKey,
+  gitRepoName,
+  gitRepoOwner,
+  mergeTargetBranch
+) {
   try {
     // get all open pull requests for the given repository
     const { data: pullRequests } = await octokit.request(
@@ -92,7 +130,7 @@ async function findPullRequest(ticketKey, gitRepoName, gitRepoOwner) {
         owner: gitRepoOwner,
         repo: gitRepoName,
         state: "open",
-        base: "master",
+        base: mergeTargetBranch,
         per_page: 100
       }
     );
@@ -364,22 +402,29 @@ async function mergePullRequest(pullRequestNr, gitRepoName, gitRepoOwner) {
   }
 }
 
+const MERGE_STAGING_TICKET_STATUS = "STAGING FOR RELEASE";
+const MERGE_MASTER_TICKET_STATUS = "RELEASE APPROVED";
+
 /**
  * Main function that is called by the webhook
  * @param {json} jsonPayload
  * @returns {object} {success: boolean, message: string}
  */
-exports.main = async (jsonPayload) => {
-  const webhookPayload = jsonPayload;
-
-  // check if the webhook payload contains the required data
-  const {
-    project,
-    key: ticketKey,
-    status: ticketStatus,
-    github_repo_name: gitRepoName,
-    github_repo_owner: gitRepoOwner
-  } = webhookPayload;
+exports.main = async ({
+  project,
+  key,
+  status,
+  // eslint-disable-next-line camelcase
+  github_repo_name,
+  // eslint-disable-next-line camelcase
+  github_repo_owner
+}) => {
+  const ticketKey = key;
+  const ticketStatus = status.toUpperCase();
+  // eslint-disable-next-line camelcase
+  const gitRepoName = github_repo_name;
+  // eslint-disable-next-line camelcase
+  const gitRepoOwner = github_repo_owner;
 
   if (
     !project ||
@@ -398,45 +443,108 @@ exports.main = async (jsonPayload) => {
     };
   }
 
-  // lookup the pull request number for the given ticket key
-  const pullRequestResult = await findPullRequest(
-    ticketKey,
-    gitRepoName,
-    gitRepoOwner
-  );
-
-  if (pullRequestResult.success) {
-    const approvalResult = await approvePullRequest(
-      pullRequestResult.data,
-      gitRepoName,
-      gitRepoOwner,
-      ticketKey,
-      ticketStatus
-    );
-    if (!approvalResult.success) {
-      return {
-        statusCode: 400,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(approvalResult)
-      };
-    }
-
-    // merge the pull request
-    const mergeResult = await mergePullRequest(
-      pullRequestResult.data,
-      gitRepoName,
-      gitRepoOwner
-    );
-
+  if (
+    ticketStatus !== MERGE_MASTER_TICKET_STATUS &&
+    ticketStatus !== MERGE_STAGING_TICKET_STATUS
+  ) {
     return {
       statusCode: 200,
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(mergeResult)
+      body: JSON.stringify({
+        success: true,
+        message: `Ignoring event, received status ${ticketStatus}, expected one of: ${MERGE_STAGING_TICKET_STATUS}, ${MERGE_MASTER_TICKET_STATUS}`
+      })
     };
   }
+
+  if (ticketStatus === MERGE_STAGING_TICKET_STATUS) {
+    // lookup the pull request number for the given ticket key
+    const pullRequestResult = await findPullRequest(
+      ticketKey,
+      gitRepoName,
+      gitRepoOwner,
+      "staging"
+    );
+
+    if (pullRequestResult.success) {
+      /*
+      const approvalResult = await approvePullRequest(
+        pullRequestResult.data,
+        gitRepoName,
+        gitRepoOwner,
+        ticketKey,
+        ticketStatus
+      );
+      if (!approvalResult.success) {
+        return {
+          statusCode: 400,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(approvalResult)
+        };
+      }
+      */
+
+      // merge the pull request
+      const mergeResult = await mergePullRequest(
+        pullRequestResult.data,
+        gitRepoName,
+        gitRepoOwner
+      );
+
+      return {
+        statusCode: 200,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(mergeResult)
+      };
+    }
+    return {
+      statusCode: 400,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(pullRequestResult)
+    };
+  }
+  const squashCommits = await findCommits(
+    gitRepoOwner,
+    gitRepoName,
+    "staging",
+    ticketKey
+  );
+
+  if (squashCommits.length === 0) {
+    return {
+      statusCode: 200,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        success: false,
+        message: `Could not find commits for cherry-picking associated with ${ticketKey}`
+      })
+    };
+  }
+
+  console.log(squashCommits.map((data) => data.sha));
+
+  const newHeadSha = await cherryPickCommits({
+    // The SHA list of the commits to cherry-pick.
+    // The commits will be cherry-picked in the order they appear in the array.
+    // Merge commits are not supported.
+    // See https://git-scm.com/docs/git-cherry-pick for more details.
+    commits: squashCommits.map((data) => data.sha),
+    // The name of the branch/reference on top of which the commits will be cherry-picked.
+    head: "master",
+    // An already authenticated instance of https://www.npmjs.com/package/@octokit/rest.
+    octokit,
+    // The username of the repository owner.
+    owner: gitRepoOwner,
+    // The name of the repository.
+    repo: gitRepoName
+  });
+
   return {
-    statusCode: 400,
+    statusCode: 200,
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(pullRequestResult)
+    body: JSON.stringify({
+      success: true,
+      message: `Squashed commits for ${ticketKey}, new HEAD SHA ${newHeadSha}`
+    })
   };
 };
